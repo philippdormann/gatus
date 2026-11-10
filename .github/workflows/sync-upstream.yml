@@ -1,0 +1,115 @@
+name: sync-upstream
+
+# Keeps this fork on the latest upstream RELEASE (not every upstream commit):
+# weekly check, merge the release tag, re-apply the CVE dependency pins,
+# verify, push, and optionally dispatch the trivy-gated build.
+# Fail-closed: unexpected merge conflicts or failing checks stop the job and
+# nothing is pushed; a CVEd/untestable tree never reaches the image gate.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      auto-build:
+        description: 'Dispatch the trivy-gated build after a successful sync'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  UPSTREAM_REPO: TwiN/gatus
+  PIN_GO_JOSE: github.com/go-jose/go-jose/v4@v4.1.9
+  PIN_COMPRESS: github.com/klauspost/compress@v1.20.4
+  PIN_IMAGE: golang.org/x/image@v0.48.0
+  PIN_NET: golang.org/x/net@v0.62.0
+
+jobs:
+  sync:
+    name: sync-upstream-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.3
+
+      - name: Detect latest upstream release
+        id: release
+        run: |
+          TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $TAG"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if sync is needed
+        id: check
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream --tags --force
+          if git merge-base --is-ancestor "${{ steps.release.outputs.tag }}" HEAD; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "HEAD already contains ${{ steps.release.outputs.tag }} - nothing to do."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Sync needed: ${{ steps.release.outputs.tag }} is not in HEAD."
+          fi
+
+      - name: Merge upstream release
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git merge --no-ff "refs/tags/${{ steps.release.outputs.tag }}" \
+            -m "chore: sync upstream release ${{ steps.release.outputs.tag }}"
+          CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+          if [ -z "$CONFLICTS" ]; then
+            echo "Clean merge."
+            exit 0
+          fi
+          echo "Conflicts in:"
+          echo "$CONFLICTS"
+          UNEXPECTED=$(echo "$CONFLICTS" | grep -vxE 'go\.mod|go\.sum' || true)
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Unexpected conflicts outside go.mod/go.sum - aborting for manual resolution."
+            git merge --abort
+            exit 1
+          fi
+          echo "Only go.mod/go.sum conflicted - keeping upstream, then re-applying CVE pins."
+          git checkout --theirs -- go.mod go.sum
+          go get "$PIN_GO_JOSE" "$PIN_COMPRESS" "$PIN_IMAGE" "$PIN_NET"
+          go mod tidy
+          git add go.mod go.sum
+          GIT_EDITOR=true git merge --continue
+
+      - name: Verify (build + tests)
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          go build ./...
+          if go test ./... 2>&1 | grep -E "FAIL|panic"; then
+            echo "Tests failed - not pushing."
+            exit 1
+          fi
+          echo "Build and tests passed."
+
+      - name: Push sync commit
+        if: steps.check.outputs.needed == 'true'
+        run: git push origin HEAD:master
+
+      - name: Dispatch gated build
+        if: steps.check.outputs.needed == 'true' && inputs.auto-build != false
+        run: gh workflow run build --ref master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
