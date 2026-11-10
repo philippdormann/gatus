@@ -33,7 +33,7 @@ jobs:
       - name: Trivy gate (fail on ANY HIGH or CRITICAL)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          input: ${{ env.IMAGE }}:${{ github.sha }}
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
           severity: HIGH,CRITICAL
           exit-code: '1'
           ignore-unfixed: false
